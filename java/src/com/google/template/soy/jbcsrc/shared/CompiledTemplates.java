@@ -1,0 +1,395 @@
+/*
+ * Copyright 2015 Google Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package com.google.template.soy.jbcsrc.shared;
+
+import static com.google.common.base.Preconditions.checkNotNull;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.ImmutableSortedSet;
+import com.google.common.collect.Sets;
+import com.google.errorprone.annotations.Immutable;
+import com.google.errorprone.annotations.concurrent.LazyInit;
+import com.google.template.soy.data.SanitizedContent.ContentKind;
+import com.google.template.soy.jbcsrc.shared.TemplateMetadata.DelTemplateMetadata;
+import com.google.template.soy.shared.internal.DelTemplateSelector;
+import java.lang.reflect.Method;
+import java.util.HashSet;
+import java.util.LinkedHashSet;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Predicate;
+import javax.annotation.Nullable;
+
+/** The result of template compilation. */
+public class CompiledTemplates {
+  private final ClassLoader loader;
+  private final ConcurrentHashMap<String, TemplateData> templateNameToFactory =
+      new ConcurrentHashMap<>();
+  final DelTemplateSelector<TemplateData> selector;
+
+  /** Interface for constructor. */
+  public interface Factory {
+    CompiledTemplates create(ImmutableSet<String> delTemplateNames, ClassLoader loader);
+  }
+
+  /**
+   * @param delTemplateNames The names of all the compiled deltemplates (the mangled names). This is
+   *     needed to construct a valid deltemplate selector.
+   * @param loader The classloader that contains the classes
+   */
+  public CompiledTemplates(ImmutableSet<String> delTemplateNames, ClassLoader loader) {
+    this.loader = checkNotNull(loader);
+    // We need to build the deltemplate selector eagerly.
+    DelTemplateSelector.Builder<TemplateData> builder = new DelTemplateSelector.Builder<>();
+    for (String delTemplateImplName : delTemplateNames) {
+      TemplateData data = getTemplateData(delTemplateImplName);
+      if (!data.delTemplateName.isPresent()) {
+        throw new IllegalArgumentException(
+            "Expected " + delTemplateImplName + " to be a deltemplate");
+      }
+      String delTemplateName = data.delTemplateName.get();
+      if (data.modName.isPresent()) {
+        String modName = data.modName.get();
+        TemplateData prev = builder.add(delTemplateName, modName, data.variant, data);
+        if (prev != null) {
+          throw new IllegalArgumentException(
+              String.format(
+                  "Found multiple deltemplates with the same name (%s) and package (%s). %s and %s",
+                  delTemplateName, modName, delTemplateImplName, prev.soyTemplateName()));
+        }
+      } else {
+        TemplateData prev = builder.addDefault(delTemplateName, data.variant, data);
+        if (prev != null) {
+          throw new IllegalArgumentException(
+              String.format(
+                  "Found multiple default deltemplates with the same name (%s). %s and %s",
+                  delTemplateName, delTemplateImplName, prev.soyTemplateName()));
+        }
+      }
+    }
+    this.selector = builder.build();
+  }
+
+  ClassLoader getClassLoader() {
+    return loader;
+  }
+
+  /** Returns a factory for the given fully qualified template name. */
+  public CompiledTemplate getTemplate(String name) {
+    return getTemplateData(name).template();
+  }
+
+  /**
+   * Returns the transitive closure of all the injected params that might be used by this template.
+   */
+  public ImmutableSortedSet<String> getTransitiveIjParamsForTemplate(String templateName) {
+    TemplateData templateData = getTemplateData(templateName);
+    ImmutableSortedSet<String> transitiveIjParams = templateData.transitiveIjParams;
+    // racy-lazy init pattern.  We may calculate this more than once, but that is fine because each
+    // time should calculate the same value.
+    if (transitiveIjParams != null) {
+      // early return, we already calculated this.
+      return transitiveIjParams;
+    }
+    Set<TemplateData> all = new HashSet<>();
+    collectTransitiveCallees(templateData, all);
+    ImmutableSortedSet.Builder<String> ijs = ImmutableSortedSet.naturalOrder();
+    for (TemplateData callee : all) {
+      ijs.addAll(callee.injectedParams);
+    }
+    transitiveIjParams = ijs.build();
+    // save the results
+    templateData.transitiveIjParams = transitiveIjParams;
+    return transitiveIjParams;
+  }
+
+  /** Returns the immediate css namespaces that might be used by this template. */
+  public ImmutableList<String> getRequiredCssNamespaces(String templateName) {
+    return getTemplateData(templateName).requiredCssNamespaces.asList();
+  }
+
+  /** Returns the immediate css namespaces that might be used by this template. */
+  public ImmutableList<String> getRequiredCssPaths(String templateName) {
+    return getTemplateData(templateName).requiredCssPaths.asList();
+  }
+
+  /**
+   * Returns the transitive closure of all the css namespaces that might be used by this template.
+   */
+  public ImmutableList<String> getAllRequiredCssNamespaces(
+      String templateName, Predicate<String> enabledMods, boolean collectCssFromDelvariants) {
+    TemplateData templateData = getTemplateData(templateName);
+    Set<TemplateData> orderedTemplateCalls = Sets.newLinkedHashSet();
+    Set<TemplateData> visited = Sets.newLinkedHashSet();
+    collectTransitiveCallees(
+        templateData, orderedTemplateCalls, visited, enabledMods, collectCssFromDelvariants);
+    LinkedHashSet<String> requiredNamespaces = Sets.newLinkedHashSet();
+    for (TemplateData callee : orderedTemplateCalls) {
+      requiredNamespaces.addAll(callee.requiredCssNamespaces);
+    }
+    return ImmutableList.copyOf(requiredNamespaces);
+  }
+
+  /**
+   * Returns the transitive closure of all the css namespaces that might be used by this template.
+   */
+  public ImmutableList<String> getAllRequiredCssPaths(
+      String templateName, Predicate<String> enabledMods, boolean collectCssFromDelvariants) {
+    TemplateData templateData = getTemplateData(templateName);
+    Set<TemplateData> orderedTemplateCalls = Sets.newLinkedHashSet();
+    Set<TemplateData> visited = Sets.newLinkedHashSet();
+    collectTransitiveCallees(
+        templateData, orderedTemplateCalls, visited, enabledMods, collectCssFromDelvariants);
+    LinkedHashSet<String> requiredPaths = Sets.newLinkedHashSet();
+    for (TemplateData callee : orderedTemplateCalls) {
+      requiredPaths.addAll(callee.requiredCssPaths);
+    }
+    return ImmutableList.copyOf(requiredPaths);
+  }
+
+  /** Returns an active delegate for the given name, variant and active package selector. */
+  @Nullable
+  CompiledTemplate selectDelTemplate(
+      String delTemplateName, String variant, Predicate<String> activeModSelector) {
+    TemplateData selectedTemplate =
+        selector.selectTemplate(delTemplateName, variant, activeModSelector);
+    if (selectedTemplate == null) {
+      return null;
+    }
+    return selectedTemplate.template();
+  }
+
+  public TemplateData getTemplateData(String name) {
+    checkNotNull(name);
+    TemplateData template = templateNameToFactory.get(name);
+    if (template == null) {
+      template = loadTemplate(name, loader);
+      TemplateData old = templateNameToFactory.putIfAbsent(name, template);
+      if (old != null) {
+        return old;
+      }
+    }
+    return template;
+  }
+
+  private static TemplateData loadTemplate(String name, ClassLoader loader) {
+    Class<?> templateClass;
+    try {
+      String templateName = Names.javaClassNameFromSoyTemplateName(name);
+      templateClass = Class.forName(templateName, /* initialize= */ true, loader);
+    } catch (ClassNotFoundException e) {
+      String format = "No class was compiled for template: %s.";
+      throw new IllegalArgumentException(String.format(format, name), e);
+    }
+    return new TemplateData(templateClass, name);
+  }
+
+  /**
+   * Adds all transitively called templates to {@code visited}. {@code templateData} may be null in
+   * the case of a stubbed template.
+   */
+  private void collectTransitiveCallees(
+      @Nullable TemplateData templateData, Set<TemplateData> visited) {
+    if (templateData == null || visited.contains(templateData)) {
+      return; // avoids chasing recursive cycles
+    }
+    visited.add(templateData);
+    for (String callee : templateData.callees) {
+      collectTransitiveCallees(getTemplateData(callee), visited);
+    }
+    for (String delCallee : templateData.delCallees) {
+      // for {delcalls} and calls to modifiable templates we consider all possible targets
+      for (TemplateData potentialCallee : selector.delTemplateNameToValues().get(delCallee)) {
+        collectTransitiveCallees(potentialCallee, visited);
+      }
+    }
+  }
+
+  /**
+   * Adds all transitively called templates to {@code visited}. {@code templateData} may be null in
+   * the case of a deltemplate with no implementation or a stubbed template.
+   */
+  private void collectTransitiveCallees(
+      @Nullable TemplateData templateData,
+      Set<TemplateData> orderedTemplateCalls,
+      Set<TemplateData> visited,
+      Predicate<String> enabledMods,
+      boolean collectCssFromDelvariants) {
+    // templateData is null if a deltemplate has no implementation.
+    if (templateData == null || visited.contains(templateData)) {
+      return; // avoids chasing recursive cycles
+    }
+    visited.add(templateData);
+    // TODO(tomnguyen) It may be important to collect css in lexical order instead of
+    // separating templates and deltemplates.
+    for (String callee : templateData.callees) {
+      collectTransitiveCallees(
+          getTemplateData(callee),
+          orderedTemplateCalls,
+          visited,
+          enabledMods,
+          collectCssFromDelvariants);
+    }
+    for (String delCallee : templateData.delCallees) {
+      selector.delTemplateNameToValues().get(delCallee).stream()
+          .map(tmpl -> tmpl.variant)
+          .filter(variant -> collectCssFromDelvariants || variant.isEmpty())
+          .distinct()
+          .forEach(
+              variant ->
+                  collectTransitiveCallees(
+                      selector.selectTemplate(delCallee, variant, enabledMods),
+                      orderedTemplateCalls,
+                      visited,
+                      enabledMods,
+                      collectCssFromDelvariants));
+    }
+    orderedTemplateCalls.add(templateData);
+  }
+
+  /** This is mostly a copy of the {@link TemplateMetadata} annotation. */
+  @Immutable
+  public static final class TemplateData {
+    @SuppressWarnings("Immutable")
+    final Method templateMethod;
+
+    final String soyTemplateName;
+    // lazily initialized since it is not always needed
+    @LazyInit CompiledTemplate template;
+
+    // many of these fields should probably be only lazily calculated
+    final ContentKind kind;
+    final ImmutableSet<String> callees;
+    final ImmutableSet<String> delCallees;
+    final ImmutableSet<String> injectedParams;
+    final ImmutableSet<String> requiredCssNamespaces;
+    final ImmutableSet<String> requiredCssPaths;
+
+    // If this is a deltemplate then delTemplateName will be present
+    final Optional<String> delTemplateName;
+    final Optional<String> modName;
+    final String variant;
+
+    // Lazily initialized by getTransitiveIjParamsForTemplate.  We initialize lazily because in
+    // general this is only needed for relatively few templates.
+    @LazyInit ImmutableSortedSet<String> transitiveIjParams;
+
+    public TemplateData(Class<?> fileClass, String soyTemplateName) {
+      this(getTemplateMethod(fileClass, soyTemplateName), soyTemplateName);
+    }
+
+    @VisibleForTesting
+    public TemplateData(Method templateMethod, String soyTemplateName) {
+      this.templateMethod = templateMethod;
+      this.soyTemplateName = soyTemplateName;
+
+      // We pull the content kind off the templatemetadata eagerly since the parsing+reflection each
+      // time is expensive.
+      TemplateMetadata annotation = templateMethod.getAnnotation(TemplateMetadata.class);
+      this.kind = annotation.contentKind();
+      this.callees = ImmutableSet.copyOf(annotation.callees());
+      this.delCallees = ImmutableSet.copyOf(annotation.delCallees());
+      this.injectedParams = ImmutableSet.copyOf(annotation.injectedParams());
+      this.requiredCssNamespaces = ImmutableSet.copyOf(annotation.requiredCssNames());
+      this.requiredCssPaths = ImmutableSet.copyOf(annotation.requiredCssPaths());
+      DelTemplateMetadata deltemplateMetadata = annotation.deltemplateMetadata();
+      variant = deltemplateMetadata.variant();
+      if (!deltemplateMetadata.name().isEmpty()) {
+        delTemplateName = Optional.of(deltemplateMetadata.name());
+        modName =
+            deltemplateMetadata.modName().isEmpty()
+                ? Optional.empty()
+                : Optional.of(deltemplateMetadata.modName());
+      } else {
+        this.delTemplateName = Optional.empty();
+        this.modName = Optional.empty();
+      }
+    }
+
+    private static Method getTemplateMethod(Class<?> fileClass, String soyTemplateName) {
+      String templateMethodName = Names.renderMethodNameFromSoyTemplateName(soyTemplateName);
+      try {
+        return fileClass.getDeclaredMethod(templateMethodName);
+      } catch (NoSuchMethodException nsme) {
+        // This may be caused by:
+        //   1. Trying to call a private template. The factory() method is package private and so
+        //      getMethod will fail.
+        //   2. Two Soy files with the same namespace, without the necessary exemption. You should
+        //      also see a build breakage related to go/java-one-version.
+        throw new IllegalArgumentException(
+            "cannot find the " + templateMethodName + "() method for " + soyTemplateName, nsme);
+      }
+    }
+
+    @VisibleForTesting
+    public Class<?> templateClass() {
+      return templateMethod.getDeclaringClass();
+    }
+
+    @VisibleForTesting
+    public Method templateMethod() {
+      return templateMethod;
+    }
+
+    public ContentKind kind() {
+      return kind;
+    }
+
+    @VisibleForTesting
+    public boolean isPublicTemplate() {
+      try {
+        template();
+        return false;
+      } catch (IllegalArgumentException expected) {
+        return false;
+      }
+    }
+
+    @VisibleForTesting
+    public void setTemplate(CompiledTemplate template) {
+      this.template = template;
+    }
+
+    public CompiledTemplate template() {
+      CompiledTemplate local = template;
+      if (local == null) {
+        try {
+          local = (CompiledTemplate) templateMethod.invoke(null);
+        } catch (IllegalAccessException iae) {
+          throw new IllegalArgumentException(
+              "cannot get a factory for the private template: " + soyTemplateName(), iae);
+        } catch (ReflectiveOperationException e) {
+          // this should be impossible since our factories are public with a default constructor.
+          // TODO(lukes): failures of bytecode verification will propagate as Errors, we should
+          // consider catching them here to add information about our generated types. (e.g. add
+          // the
+          // class trace and a pointer on how to file a soy bug)
+          throw new AssertionError(e);
+        }
+        template = local;
+      }
+      return local;
+    }
+
+    String soyTemplateName() {
+      return soyTemplateName;
+    }
+  }
+}
